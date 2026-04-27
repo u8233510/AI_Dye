@@ -85,6 +85,57 @@ def _predict_with_recipe(base_inputs, recipe_concs, selected_dyes):
     }
 
 
+def _build_feature_batch(base_inputs, recipe_matrix, selected_dyes):
+    n_rows = recipe_matrix.shape[0]
+    known_dyes = st.session_state['kd']
+    feature_cols = [f'Dye_{d}' for d in known_dyes]
+    feat_df = pd.DataFrame(0.0, index=np.arange(n_rows), columns=feature_cols, dtype=float)
+
+    for i, dye in enumerate(selected_dyes):
+        if dye == '無':
+            continue
+        col = f'Dye_{dye}'
+        if col in feat_df.columns:
+            feat_df[col] += recipe_matrix[:, i]
+
+    total_conc = feat_df.sum(axis=1)
+    x_df = pd.DataFrame(
+        {
+            '標準樣L': np.full(n_rows, base_inputs['標準樣L'], dtype=float),
+            '標準樣a': np.full(n_rows, base_inputs['標準樣a'], dtype=float),
+            '標準樣b': np.full(n_rows, base_inputs['標準樣b'], dtype=float),
+            '色系名稱': np.full(n_rows, base_inputs['色系名稱']),
+            '色系編號': np.full(n_rows, base_inputs['色系編號']),
+            'DPF': np.full(n_rows, base_inputs['DPF'], dtype=float),
+            'OP否': np.full(n_rows, base_inputs['OP否']),
+            'Total_Conc': total_conc.values,
+            'Log_Total_Conc': np.log1p(total_conc.values),
+        }
+    )
+    x_df = pd.concat([x_df, feat_df], axis=1)
+    return x_df
+
+
+def _evaluate_candidates(base_inputs, candidates, selected_dyes):
+    x_batch = _build_feature_batch(base_inputs, candidates, selected_dyes)
+    preds = st.session_state['model'].predict(x_batch)
+
+    p_l = base_inputs['標準樣L'] + preds[:, 0]
+    p_a = base_inputs['標準樣a'] + preds[:, 1]
+    p_b = base_inputs['標準樣b'] + preds[:, 2]
+
+    de_list = [
+        deltaE_CMC(
+            (base_inputs['標準樣L'], base_inputs['標準樣a'], base_inputs['標準樣b']),
+            (pl, pa, pb),
+        )
+        for pl, pa, pb in zip(p_l, p_a, p_b)
+    ]
+    de_arr = np.asarray(de_list, dtype=float)
+    score_arr = de_arr + 0.01 * candidates.sum(axis=1)
+    return preds, de_arr, score_arr
+
+
 def _recommend_recipe(base_inputs, selected_dyes):
     conc_summary = _collect_concentration_stats(st.session_state['df_raw'], st.session_state['dc'])
     upper_bounds = _candidate_upper_bounds(selected_dyes, conc_summary)
@@ -92,34 +143,44 @@ def _recommend_recipe(base_inputs, selected_dyes):
     rng = np.random.default_rng(42)
     n_slots = len(selected_dyes)
 
-    best_x = np.zeros(n_slots, dtype=float)
-    best_result = _predict_with_recipe(base_inputs, best_x, selected_dyes)
-    best_score = best_result['pred_DE'] + 0.01 * best_x.sum()
-
     n_samples = 1400
     random_candidates = rng.random((n_samples, n_slots)) * upper_bounds
-    random_candidates = np.vstack([np.zeros((1, n_slots)), random_candidates])
+    masked_random = np.vstack([np.zeros((1, n_slots)), random_candidates])
+    masked_random = np.where(np.array(selected_dyes) == '無', 0.0, masked_random)
 
-    for cand in random_candidates:
-        cand = np.where(np.array(selected_dyes) == '無', 0.0, cand)
-        result = _predict_with_recipe(base_inputs, cand, selected_dyes)
-        score = result['pred_DE'] + 0.01 * cand.sum()
-        if score < best_score:
-            best_score = score
-            best_x = cand.copy()
-            best_result = result
+    preds, de_arr, score_arr = _evaluate_candidates(base_inputs, masked_random, selected_dyes)
+    best_idx = int(np.argmin(score_arr))
+    best_x = masked_random[best_idx].copy()
+    best_score = float(score_arr[best_idx])
+    best_result = {
+        'pred_L': float(base_inputs['標準樣L'] + preds[best_idx, 0]),
+        'pred_a': float(base_inputs['標準樣a'] + preds[best_idx, 1]),
+        'pred_b': float(base_inputs['標準樣b'] + preds[best_idx, 2]),
+        'pred_DL': float(preds[best_idx, 0]),
+        'pred_Da': float(preds[best_idx, 1]),
+        'pred_Db': float(preds[best_idx, 2]),
+        'pred_DE': float(de_arr[best_idx]),
+    }
 
     for _ in range(8):
         noise = rng.normal(loc=0.0, scale=0.1, size=(300, n_slots))
         local_candidates = np.clip(best_x * (1 + noise), 0.0, upper_bounds)
-        for cand in local_candidates:
-            cand = np.where(np.array(selected_dyes) == '無', 0.0, cand)
-            result = _predict_with_recipe(base_inputs, cand, selected_dyes)
-            score = result['pred_DE'] + 0.01 * cand.sum()
-            if score < best_score:
-                best_score = score
-                best_x = cand.copy()
-                best_result = result
+        local_candidates = np.where(np.array(selected_dyes) == '無', 0.0, local_candidates)
+        preds, de_arr, score_arr = _evaluate_candidates(base_inputs, local_candidates, selected_dyes)
+        local_best_idx = int(np.argmin(score_arr))
+        local_best_score = float(score_arr[local_best_idx])
+        if local_best_score < best_score:
+            best_score = local_best_score
+            best_x = local_candidates[local_best_idx].copy()
+            best_result = {
+                'pred_L': float(base_inputs['標準樣L'] + preds[local_best_idx, 0]),
+                'pred_a': float(base_inputs['標準樣a'] + preds[local_best_idx, 1]),
+                'pred_b': float(base_inputs['標準樣b'] + preds[local_best_idx, 2]),
+                'pred_DL': float(preds[local_best_idx, 0]),
+                'pred_Da': float(preds[local_best_idx, 1]),
+                'pred_Db': float(preds[local_best_idx, 2]),
+                'pred_DE': float(de_arr[local_best_idx]),
+            }
 
     return best_x, best_result
 
