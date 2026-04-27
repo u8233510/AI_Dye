@@ -9,6 +9,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, VotingRegressor, HistGradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import train_test_split 
+from recipe_recommender import build_dye_bounds, recommend_recipe
 
 # ==========================================
 # 0. 核心包裝：確保權重支援
@@ -75,7 +76,7 @@ st.set_page_config(page_title="AI 專業打色系統 v20.0", layout="wide")
 st.sidebar.title("⚙️ AI 系統配置")
 uploaded_file = st.sidebar.file_uploader("1. 上傳打色資料", type=["csv", "xlsx"])
 
-tab_ana, tab_feedback, tab_val = st.tabs(["📊 數據分布分析", "📈 訓練回測回饋", "🔍 單筆輸入預測"])
+tab_ana, tab_feedback, tab_val, tab_recipe = st.tabs(["📊 數據分布分析", "📈 訓練回測回饋", "🔍 單筆輸入預測", "🧠 染料配方推薦"])
 
 if uploaded_file:
     df_raw = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
@@ -158,6 +159,7 @@ if uploaded_file:
             df_c = df_train.copy()
             for dc in dye_cols: df_c[dc] = df_c[dc].apply(clean_dye_id)
             X_bag, known_dyes = transform_bag_of_dyes(df_c, dye_cols)
+            dye_bounds = build_dye_bounds(df_c, dye_cols, known_dyes, clean_dye_id)
             #Y = df_train[['L', 'a', 'b']]
             #Y = df_train[['CIE_DL', 'CIE_Da', 'CIE_Db']]
             
@@ -273,7 +275,7 @@ if uploaded_file:
             #df_fb['預測DE'] = [deltaE_CMC((df_fb.loc[i, 'stdL'], df_fb.loc[i, 'stda'], df_fb.loc[i, 'stdb']), (preds[i,0], preds[i,1], preds[i,2])) for i in range(len(df_fb))]
             df_fb['預測DE'] = [deltaE_CMC((df_fb.loc[i, 'stdL'], df_fb.loc[i, 'stda'], df_fb.loc[i, 'stdb']), (df_fb.loc[i, '預測L'], df_fb.loc[i, '預測a'], df_fb.loc[i, '預測b'])) for i in range(len(df_fb))]
             
-            st.session_state.update({'model': model, 'kd': known_dyes, 'fb': df_fb, 'dc': dye_cols, 'df_raw': df_raw})
+            st.session_state.update({'model': model, 'kd': known_dyes, 'fb': df_fb, 'dc': dye_cols, 'df_raw': df_raw, 'dye_bounds': dye_bounds})
             st.sidebar.success(f"訓練完成！")
 
 # --- 修正 2: 訓練回測回饋 (詳細顯示 7 項指標比對) ---
@@ -406,5 +408,86 @@ with tab_val:
                     st.success("✅ 合格 (DE <= 0.8)")
                 else: 
                     st.error("❌ 不合格 (DE > 0.8)")
+    else:
+        st.warning("請先完成模型訓練。")
+
+# --- 分頁 4: 染料配方推薦 ---
+with tab_recipe:
+    if 'model' in st.session_state:
+        st.header("🧠 染料配方推薦")
+        st.caption("輸入欄位與訓練一致，但不需輸入配方用量，由 AI 自動推薦濃度。")
+
+        col_in, col_res = st.columns([2, 1])
+        with col_in:
+            with st.form("recipe_recommend_form"):
+                st.write("#### 1. 物理參數 (標樣數值作為核心輸入)")
+                c1, c2, c3, c4 = st.columns(4)
+                r_name = c1.selectbox("色系名稱 (記錄用)", sorted(st.session_state['df_raw']['色系名稱'].astype(str).unique()), key="r_name")
+                r_id = c2.selectbox("色系編號 (記錄用)", sorted(st.session_state['df_raw']['色系編號'].astype(str).unique()), key="r_id")
+                r_dpf = c3.number_input("DPF", value=1.0, key="r_dpf")
+                r_op = c4.selectbox("OP否", ['Y', 'N'], key="r_op")
+
+                csL, csa, csb = st.columns(3)
+                r_std_l = csL.number_input("標準樣 L*", value=50.0, key="r_std_l")
+                r_std_a = csa.number_input("標準樣 a*", value=0.0, key="r_std_a")
+                r_std_b = csb.number_input("標準樣 b*", value=0.0, key="r_std_b")
+
+                st.write("#### 2. 指定最多 6 支候選染料 (不填濃度)")
+                selected_dyes = []
+                for i in range(1, 7):
+                    dye_pick = st.selectbox(
+                        f"配方料號 {i}",
+                        ['無'] + st.session_state['kd'],
+                        key=f"r_p{i}"
+                    )
+                    if dye_pick != '無' and dye_pick not in selected_dyes:
+                        selected_dyes.append(dye_pick)
+
+                n_search = st.slider("搜尋次數 (越高越精準，速度越慢)", min_value=500, max_value=5000, value=1500, step=250)
+                recommend_btn = st.form_submit_button("✨ AI 推薦配方", type="primary")
+
+        if recommend_btn:
+            result = recommend_recipe(
+                model=st.session_state['model'],
+                transform_bag_of_dyes_fn=transform_bag_of_dyes,
+                deltae_cmc_fn=deltaE_CMC,
+                known_dyes=st.session_state['kd'],
+                dye_cols=st.session_state['dc'],
+                std_l=r_std_l,
+                std_a=r_std_a,
+                std_b=r_std_b,
+                dpf=r_dpf,
+                op=r_op,
+                shade_name=r_name,
+                shade_id=r_id,
+                selected_dyes=selected_dyes,
+                dye_bounds=st.session_state['dye_bounds'],
+                n_samples=n_search,
+                random_state=42,
+            )
+
+            with col_res:
+                st.write("### 📦 推薦結果")
+                if result is None:
+                    st.warning("請至少選擇一支染料料號。")
+                else:
+                    rec_df = pd.DataFrame(
+                        [{'染料料號': k, '推薦濃度': v} for k, v in result['recipe'].items()]
+                    )
+                    st.dataframe(rec_df.round(4), use_container_width=True)
+
+                    st.write("### 📊 根據推薦配方的預測結果")
+                    st.metric("L*", f"{result['L']:.2f}")
+                    st.metric("a*", f"{result['a']:.2f}")
+                    st.metric("b*", f"{result['b']:.2f}")
+                    st.metric("DL", f"{result['DL']:.3f}")
+                    st.metric("Da", f"{result['Da']:.3f}")
+                    st.metric("Db", f"{result['Db']:.3f}")
+                    st.metric("CMC_DE", f"{result['CMC_DE']:.3f}")
+
+                    if result['CMC_DE'] <= 0.8:
+                        st.success("✅ 推薦結果預估可合格 (DE <= 0.8)")
+                    else:
+                        st.error("❌ 推薦結果預估仍偏差 (DE > 0.8)")
     else:
         st.warning("請先完成模型訓練。")
