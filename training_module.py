@@ -1,3 +1,8 @@
+import hashlib
+import json
+from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -14,6 +19,9 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from model_utils import clean_dye_id, deltaE_CMC, transform_bag_of_dyes
+
+
+ARTIFACT_DIR = Path('.model_cache')
 
 
 class ExplicitWeightedVotingRegressor(VotingRegressor):
@@ -107,6 +115,35 @@ def _fit_automl_lite(model, X_train, Y_train, sample_weights, model_params):
     )
     automl.fit(X_train, Y_train, reg__sample_weight=sample_weights)
     return automl.best_estimator_, automl.best_params_, automl.best_score_
+
+
+def _dataset_fingerprint(df_raw, dye_cols):
+    safe = df_raw.copy().fillna('')
+    table_hash = hashlib.sha256(pd.util.hash_pandas_object(safe, index=True).values.tobytes()).hexdigest()
+    payload = {'table_hash': table_hash, 'dye_cols': list(dye_cols), 'shape': list(df_raw.shape)}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _training_signature(df_raw, dye_cols, model_type, model_params):
+    payload = {
+        'dataset': _dataset_fingerprint(df_raw, dye_cols),
+        'model_type': model_type,
+        'model_params': model_params,
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _load_cached_state(signature):
+    artifact_path = ARTIFACT_DIR / f'{signature}.joblib'
+    if artifact_path.exists():
+        return joblib.load(artifact_path)
+    return None
+
+
+def _save_cached_state(signature, state):
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    artifact_path = ARTIFACT_DIR / f'{signature}.joblib'
+    joblib.dump(state, artifact_path)
 
 
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
@@ -203,11 +240,25 @@ def render_training_button(df_raw, dye_cols):
 
     model_type = st.sidebar.selectbox('模型類型', options=list(MODEL_LABELS.keys()), format_func=lambda k: MODEL_LABELS[k])
     model_params = _render_model_params(model_type)
+    signature = _training_signature(df_raw, dye_cols, model_type, model_params)
 
     if st.sidebar.button('🚀 啟動模型訓練'):
+        if st.session_state.get('train_signature') == signature and 'model' in st.session_state:
+            st.sidebar.success('條件一致，已直接使用目前記憶體中的模型。')
+            return
+
+        cached_state = _load_cached_state(signature)
+        if cached_state is not None:
+            st.session_state.update(cached_state)
+            st.session_state['train_signature'] = signature
+            st.sidebar.success('條件一致，已載入已儲存模型。')
+            return
+
         with st.spinner('AI 運算中 (模型訓練中)...'):
             state = train_model(df_raw, dye_cols, model_type=model_type, model_params=model_params)
             st.session_state.update(state)
+            st.session_state['train_signature'] = signature
+            _save_cached_state(signature, state)
             st.sidebar.success(f"訓練完成：{state['model_label']}")
             if state.get('automl_info'):
                 st.sidebar.info(f"最佳CV分數: {state['automl_info']['best_cv_score']:.4f}")
