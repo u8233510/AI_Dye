@@ -272,19 +272,30 @@ def _optimize_de_blend_weight(y_true, de_global, de_local, local_conf):
     local_conf = np.asarray(local_conf, dtype=float)
 
     if len(y_true) == 0:
-        return {'mode': 'adaptive_confidence', 'beta': 1.0}
+        return {'mode': 'adaptive_confidence', 'beta': 1.0, 'margin': 0.0}
 
-    candidates = np.linspace(0.4, 2.2, 19)
-    best_beta = 1.0
-    best_mae = float('inf')
-    for beta in candidates:
+    beta_candidates = np.linspace(0.4, 2.2, 19)
+    margin_candidates = np.linspace(0.0, 0.8, 17)
+    best_cfg = {'mode': 'adaptive_confidence', 'beta': 1.0, 'margin': 0.0}
+    best_score = float('inf')
+    for beta in beta_candidates:
         w_local = np.clip(local_conf * beta, 0.0, 1.0)
-        blended = np.clip((1.0 - w_local) * de_global + w_local * de_local, 0.0, None)
-        mae = float(np.mean(np.abs(blended - y_true)))
-        if mae < best_mae:
-            best_mae = mae
-            best_beta = float(beta)
-    return {'mode': 'adaptive_confidence', 'beta': best_beta}
+        blended_base = np.clip((1.0 - w_local) * de_global + w_local * de_local, 0.0, None)
+        for margin in margin_candidates:
+            blended = np.clip(blended_base + margin, 0.0, None)
+            mae = float(np.mean(np.abs(blended - y_true)))
+            high_cut = float(np.quantile(y_true, 0.9))
+            high_mask = y_true >= high_cut
+            high_mae = float(np.mean(np.abs(blended[high_mask] - y_true[high_mask]))) if np.any(high_mask) else mae
+            actual_over = y_true > 0.8
+            miss_rate = float(np.mean(blended[actual_over] <= 0.8)) if np.any(actual_over) else 0.0
+
+            # 主要壓低漏判率與高風險區誤差，次要兼顧整體MAE
+            score = 4.0 * miss_rate + 1.8 * high_mae + 0.3 * mae
+            if score < best_score:
+                best_score = score
+                best_cfg = {'mode': 'adaptive_confidence', 'beta': float(beta), 'margin': float(margin)}
+    return best_cfg
 
 
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
@@ -404,9 +415,10 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
     y_de_test = df_train.loc[X_test.index, 'CMC_DE'].values
     blend_cfg = _optimize_de_blend_weight(y_de_test, de_test_global, de_test_local, local_conf)
     beta = float(blend_cfg.get('beta', 1.0))
+    margin = float(blend_cfg.get('margin', 0.0))
     local_weight = np.clip(local_conf * beta, 0.0, 1.0)
     global_weight = 1.0 - local_weight
-    df_fb['預測DE_模型'] = np.clip(global_weight * de_test_global + local_weight * de_test_local, 0.0, None)
+    df_fb['預測DE_模型'] = np.clip(global_weight * de_test_global + local_weight * de_test_local + margin, 0.0, None)
 
     return {
         'model': model,
