@@ -33,6 +33,7 @@ except ImportError:
 
 
 ARTIFACT_DIR = Path('.model_cache')
+TRAINING_PIPELINE_VERSION = '2026-04-28-v2'
 
 
 class ExplicitWeightedVotingRegressor(VotingRegressor):
@@ -186,6 +187,7 @@ def _dataset_fingerprint(df_raw, dye_cols):
 
 def _training_signature(df_raw, dye_cols, model_type, model_params):
     payload = {
+        'pipeline_version': TRAINING_PIPELINE_VERSION,
         'dataset': _dataset_fingerprint(df_raw, dye_cols),
         'model_type': model_type,
         'model_params': model_params,
@@ -238,18 +240,62 @@ def _fit_local_de_model(X_train, y_de_train):
     k = min(25, max(5, int(np.sqrt(max(n, 1)))))
     local_model = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
     local_model.fit(X_enc, y_de_train)
+    dists, _ = local_model.kneighbors(X_enc, n_neighbors=k, return_distance=True)
+    ref_dist = float(np.median(dists[:, -1])) if len(dists) else 1.0
+    if not np.isfinite(ref_dist) or ref_dist <= 1e-9:
+        ref_dist = 1.0
     return {
         'model': local_model,
         'cat_cols': cat_cols,
         'feature_columns': list(X_enc.columns),
+        'distance_scale': ref_dist,
     }
 
 
-def _predict_local_de(local_de_model, X):
+def _predict_local_de(local_de_model, X, return_confidence=False):
     X_enc = pd.get_dummies(X, columns=local_de_model['cat_cols'], dummy_na=False)
     X_enc = X_enc.reindex(columns=local_de_model['feature_columns'], fill_value=0.0)
     pred = local_de_model['model'].predict(X_enc)
-    return np.clip(pred, 0.0, None)
+    pred = np.clip(pred, 0.0, None)
+    if not return_confidence:
+        return pred
+    dists, _ = local_de_model['model'].kneighbors(X_enc, n_neighbors=1, return_distance=True)
+    distance_scale = float(local_de_model.get('distance_scale', 1.0))
+    conf = np.exp(-dists[:, 0] / max(distance_scale, 1e-9))
+    return pred, np.clip(conf, 0.0, 1.0)
+
+
+def _optimize_de_blend_weight(y_true, de_global, de_local, local_conf):
+    y_true = np.asarray(y_true, dtype=float)
+    de_global = np.asarray(de_global, dtype=float)
+    de_local = np.asarray(de_local, dtype=float)
+    local_conf = np.asarray(local_conf, dtype=float)
+
+    if len(y_true) == 0:
+        return {'mode': 'adaptive_confidence', 'beta': 1.0, 'margin': 0.0}
+
+    beta_candidates = np.linspace(0.4, 2.2, 19)
+    margin_candidates = np.linspace(0.0, 0.8, 17)
+    best_cfg = {'mode': 'adaptive_confidence', 'beta': 1.0, 'margin': 0.0}
+    best_score = float('inf')
+    for beta in beta_candidates:
+        w_local = np.clip(local_conf * beta, 0.0, 1.0)
+        blended_base = np.clip((1.0 - w_local) * de_global + w_local * de_local, 0.0, None)
+        for margin in margin_candidates:
+            blended = np.clip(blended_base + margin, 0.0, None)
+            mae = float(np.mean(np.abs(blended - y_true)))
+            high_cut = float(np.quantile(y_true, 0.9))
+            high_mask = y_true >= high_cut
+            high_mae = float(np.mean(np.abs(blended[high_mask] - y_true[high_mask]))) if np.any(high_mask) else mae
+            actual_over = y_true > 0.8
+            miss_rate = float(np.mean(blended[actual_over] <= 0.8)) if np.any(actual_over) else 0.0
+
+            # 主要壓低漏判率與高風險區誤差，次要兼顧整體MAE
+            score = 4.0 * miss_rate + 1.8 * high_mae + 0.3 * mae
+            if score < best_score:
+                best_score = score
+                best_cfg = {'mode': 'adaptive_confidence', 'beta': float(beta), 'margin': float(margin)}
+    return best_cfg
 
 
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
@@ -365,14 +411,21 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
     ]
     de_test_raw = np.clip(de_model.predict(X_test), 0, None)
     de_test_global = _apply_linear_de_calibrator(de_test_raw, de_calibration)
-    de_test_local = _predict_local_de(local_de_model, X_test)
-    df_fb['預測DE_模型'] = np.clip(0.45 * de_test_global + 0.55 * de_test_local, 0.0, None)
+    de_test_local, local_conf = _predict_local_de(local_de_model, X_test, return_confidence=True)
+    y_de_test = df_train.loc[X_test.index, 'CMC_DE'].values
+    blend_cfg = _optimize_de_blend_weight(y_de_test, de_test_global, de_test_local, local_conf)
+    beta = float(blend_cfg.get('beta', 1.0))
+    margin = float(blend_cfg.get('margin', 0.0))
+    local_weight = np.clip(local_conf * beta, 0.0, 1.0)
+    global_weight = 1.0 - local_weight
+    df_fb['預測DE_模型'] = np.clip(global_weight * de_test_global + local_weight * de_test_local + margin, 0.0, None)
 
     return {
         'model': model,
         'de_model': de_model,
         'de_calibration': de_calibration,
         'local_de_model': local_de_model,
+        'de_blend_weights': blend_cfg,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,
@@ -446,14 +499,15 @@ def render_training_button(df_raw, dye_cols):
 
     model_type = st.sidebar.selectbox('模型類型', options=list(MODEL_LABELS.keys()), format_func=lambda k: MODEL_LABELS[k])
     model_params = _render_model_params(model_type)
+    force_retrain = st.sidebar.checkbox('忽略快取並強制重訓', value=False, help='勾選後會重新訓練，不使用記憶體與磁碟快取模型。')
     signature = _training_signature(df_raw, dye_cols, model_type, model_params)
 
     if st.sidebar.button('🚀 啟動模型訓練'):
-        if st.session_state.get('train_signature') == signature and 'model' in st.session_state:
+        if (not force_retrain) and st.session_state.get('train_signature') == signature and 'model' in st.session_state:
             st.sidebar.success('條件一致，已直接使用目前記憶體中的模型。')
             return
 
-        cached_state = _load_cached_state(signature)
+        cached_state = None if force_retrain else _load_cached_state(signature)
         if cached_state is not None:
             st.session_state.update(cached_state)
             st.session_state['train_signature'] = signature
