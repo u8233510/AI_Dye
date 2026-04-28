@@ -59,8 +59,14 @@ def render_prediction(tab_val):
             p_b = std_b_val + p_Db
             de_from_lab = deltaE_CMC((std_L_val, std_a_val, std_b_val), (p_L, p_a, p_b))
             if 'de_model' in st.session_state:
-                de_val = max(float(st.session_state['de_model'].predict(X_m)[0]), 0.0)
-                de_source = '模型直預測'
+                de_raw = max(float(st.session_state['de_model'].predict(X_m)[0]), 0.0)
+                if 'de_calibration' in st.session_state:
+                    cal = st.session_state['de_calibration']
+                    de_val = max(float(de_raw * float(cal.get('slope', 1.0)) + float(cal.get('intercept', 0.0))), 0.0)
+                    de_source = '模型直預測(含校正)'
+                else:
+                    de_val = de_raw
+                    de_source = '模型直預測'
             else:
                 de_val = de_from_lab
                 de_source = '由 Lab 換算'

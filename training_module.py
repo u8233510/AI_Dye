@@ -25,6 +25,11 @@ try:
 except ImportError:
     CatBoostRegressor = None
 
+try:
+    from xgboost import XGBRegressor
+except ImportError:
+    XGBRegressor = None
+
 
 ARTIFACT_DIR = Path('.model_cache')
 
@@ -38,6 +43,7 @@ MODEL_LABELS = {
     'current_ensemble': '目前模型 (Voting Ensemble)',
     'automl_lite': 'AutoML-lite (RandomizedSearchCV)',
     'catboost': 'CatBoost (Gradient Boosting)',
+    'xgboost': 'XGBoost (Gradient Boosting)',
 }
 
 
@@ -109,6 +115,31 @@ def _build_catboost_pipeline(pre, model_params):
     )
 
 
+def _build_xgboost_pipeline(pre, model_params):
+    if XGBRegressor is None:
+        raise ImportError('XGBoost 未安裝，請先安裝 xgboost 套件。')
+
+    xgb = XGBRegressor(
+        objective='reg:absoluteerror',
+        n_estimators=int(model_params.get('xgb_n_estimators', 1000)),
+        learning_rate=float(model_params.get('xgb_learning_rate', 0.03)),
+        max_depth=int(model_params.get('xgb_max_depth', 8)),
+        subsample=float(model_params.get('xgb_subsample', 0.9)),
+        colsample_bytree=float(model_params.get('xgb_colsample_bytree', 0.9)),
+        reg_alpha=float(model_params.get('xgb_reg_alpha', 0.0)),
+        reg_lambda=float(model_params.get('xgb_reg_lambda', 1.0)),
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    return Pipeline(
+        [
+            ('pre', pre),
+            ('reg', MultiOutputRegressor(xgb)),
+        ]
+    )
+
+
 def _fit_automl_lite(model, X_train, Y_train, sample_weights, model_params):
     search_space = [
         {
@@ -174,6 +205,31 @@ def _save_cached_state(signature, state):
     joblib.dump(state, artifact_path)
 
 
+def _fit_linear_de_calibrator(y_pred_raw, y_true):
+    """用線性校正把 DE 直預測拉回實際分布，降低系統性高估/低估。"""
+    pred = np.asarray(y_pred_raw, dtype=float)
+    target = np.asarray(y_true, dtype=float)
+    if len(pred) < 2:
+        return {'slope': 1.0, 'intercept': 0.0}
+
+    if np.isclose(np.std(pred), 0.0):
+        return {'slope': 1.0, 'intercept': float(np.mean(target) - np.mean(pred))}
+
+    slope, intercept = np.polyfit(pred, target, deg=1)
+    if not np.isfinite(slope):
+        slope = 1.0
+    if not np.isfinite(intercept):
+        intercept = 0.0
+    return {'slope': float(slope), 'intercept': float(intercept)}
+
+
+def _apply_linear_de_calibrator(y_pred_raw, calibration):
+    pred = np.asarray(y_pred_raw, dtype=float)
+    slope = float(calibration.get('slope', 1.0))
+    intercept = float(calibration.get('intercept', 0.0))
+    return np.clip(pred * slope + intercept, 0.0, None)
+
+
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
     model_params = model_params or {}
 
@@ -205,6 +261,9 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
     elif model_type == 'catboost':
         model = _build_catboost_pipeline(pre, model_params)
         model.fit(X_train, Y_train, reg__sample_weight=sample_weights)
+    elif model_type == 'xgboost':
+        model = _build_xgboost_pipeline(pre, model_params)
+        model.fit(X_train, Y_train, reg__sample_weight=sample_weights)
     else:
         model = _build_current_model(pre, model_params)
         model.fit(X_train, Y_train, reg__sample_weight=sample_weights)
@@ -229,6 +288,27 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
                 ),
             ]
         )
+    elif model_type == 'xgboost':
+        de_model = Pipeline(
+            [
+                ('pre', pre_de),
+                (
+                    'reg',
+                    XGBRegressor(
+                        objective='reg:absoluteerror',
+                        n_estimators=int(model_params.get('xgb_n_estimators', 1000)),
+                        learning_rate=float(model_params.get('xgb_learning_rate', 0.03)),
+                        max_depth=int(model_params.get('xgb_max_depth', 8)),
+                        subsample=float(model_params.get('xgb_subsample', 0.9)),
+                        colsample_bytree=float(model_params.get('xgb_colsample_bytree', 0.9)),
+                        reg_alpha=float(model_params.get('xgb_reg_alpha', 0.0)),
+                        reg_lambda=float(model_params.get('xgb_reg_lambda', 1.0)),
+                        random_state=42,
+                        n_jobs=-1,
+                    ),
+                ),
+            ]
+        )
     else:
         de_model = Pipeline(
             [
@@ -236,7 +316,10 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
                 ('reg', HistGradientBoostingRegressor(loss='absolute_error', max_iter=700, learning_rate=0.03, random_state=42)),
             ]
         )
-    de_model.fit(X_train, df_train.loc[X_train.index, 'CMC_DE'], reg__sample_weight=sample_weights)
+    y_de_train = df_train.loc[X_train.index, 'CMC_DE'].values
+    de_model.fit(X_train, y_de_train, reg__sample_weight=sample_weights)
+    de_train_raw = np.clip(de_model.predict(X_train), 0, None)
+    de_calibration = _fit_linear_de_calibrator(de_train_raw, y_de_train)
 
     preds = model.predict(X_test)
 
@@ -257,11 +340,13 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
         )
         for i in range(len(df_fb))
     ]
-    df_fb['預測DE_模型'] = np.clip(de_model.predict(X_test), 0, None)
+    de_test_raw = np.clip(de_model.predict(X_test), 0, None)
+    df_fb['預測DE_模型'] = _apply_linear_de_calibrator(de_test_raw, de_calibration)
 
     return {
         'model': model,
         'de_model': de_model,
+        'de_calibration': de_calibration,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,
@@ -305,6 +390,22 @@ def _render_model_params(model_type):
         )
         params['cat_depth'] = st.sidebar.slider('CatBoost depth', min_value=4, max_value=12, value=8, step=1)
         params['cat_l2_leaf_reg'] = st.sidebar.number_input('CatBoost l2_leaf_reg', min_value=1.0, max_value=20.0, value=3.0, step=0.5)
+    elif model_type == 'xgboost':
+        st.sidebar.caption('XGBoost：高效梯度提升模型')
+        params['xgb_n_estimators'] = st.sidebar.slider('XGBoost n_estimators', min_value=300, max_value=3000, value=1000, step=100)
+        params['xgb_learning_rate'] = st.sidebar.number_input(
+            'XGBoost learning_rate',
+            min_value=0.005,
+            max_value=0.3,
+            value=0.03,
+            step=0.005,
+            format='%.3f',
+        )
+        params['xgb_max_depth'] = st.sidebar.slider('XGBoost max_depth', min_value=3, max_value=12, value=8, step=1)
+        params['xgb_subsample'] = st.sidebar.slider('XGBoost subsample', min_value=0.5, max_value=1.0, value=0.9, step=0.05)
+        params['xgb_colsample_bytree'] = st.sidebar.slider('XGBoost colsample_bytree', min_value=0.5, max_value=1.0, value=0.9, step=0.05)
+        params['xgb_reg_alpha'] = st.sidebar.number_input('XGBoost reg_alpha', min_value=0.0, max_value=10.0, value=0.0, step=0.1)
+        params['xgb_reg_lambda'] = st.sidebar.number_input('XGBoost reg_lambda', min_value=0.1, max_value=20.0, value=1.0, step=0.1)
 
     return params
 
@@ -314,6 +415,8 @@ def render_training_button(df_raw, dye_cols):
     st.sidebar.markdown('## 🤖 訓練模型選擇')
     if CatBoostRegressor is None:
         st.sidebar.warning('未偵測到 catboost 套件；若選 CatBoost 將無法訓練。')
+    if XGBRegressor is None:
+        st.sidebar.warning('未偵測到 xgboost 套件；若選 XGBoost 將無法訓練。')
 
     model_type = st.sidebar.selectbox('模型類型', options=list(MODEL_LABELS.keys()), format_func=lambda k: MODEL_LABELS[k])
     model_params = _render_model_params(model_type)
