@@ -59,8 +59,23 @@ def render_prediction(tab_val):
             p_b = std_b_val + p_Db
             de_from_lab = deltaE_CMC((std_L_val, std_a_val, std_b_val), (p_L, p_a, p_b))
             if 'de_model' in st.session_state:
-                de_val = max(float(st.session_state['de_model'].predict(X_m)[0]), 0.0)
-                de_source = '模型直預測'
+                de_raw = max(float(st.session_state['de_model'].predict(X_m)[0]), 0.0)
+                if 'de_calibration' in st.session_state:
+                    cal = st.session_state['de_calibration']
+                    de_global = max(float(de_raw * float(cal.get('slope', 1.0)) + float(cal.get('intercept', 0.0))), 0.0)
+                else:
+                    de_global = de_raw
+
+                if 'local_de_model' in st.session_state:
+                    local_pack = st.session_state['local_de_model']
+                    X_local = pd.get_dummies(X_m, columns=local_pack['cat_cols'], dummy_na=False)
+                    X_local = X_local.reindex(columns=local_pack['feature_columns'], fill_value=0.0)
+                    de_local = max(float(local_pack['model'].predict(X_local)[0]), 0.0)
+                    de_val = max(float(0.45 * de_global + 0.55 * de_local), 0.0)
+                    de_source = '模型直預測(全域+近鄰混合)'
+                else:
+                    de_val = de_global
+                    de_source = '模型直預測(全域校正)'
             else:
                 de_val = de_from_lab
                 de_source = '由 Lab 換算'
