@@ -240,18 +240,51 @@ def _fit_local_de_model(X_train, y_de_train):
     k = min(25, max(5, int(np.sqrt(max(n, 1)))))
     local_model = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
     local_model.fit(X_enc, y_de_train)
+    dists, _ = local_model.kneighbors(X_enc, n_neighbors=k, return_distance=True)
+    ref_dist = float(np.median(dists[:, -1])) if len(dists) else 1.0
+    if not np.isfinite(ref_dist) or ref_dist <= 1e-9:
+        ref_dist = 1.0
     return {
         'model': local_model,
         'cat_cols': cat_cols,
         'feature_columns': list(X_enc.columns),
+        'distance_scale': ref_dist,
     }
 
 
-def _predict_local_de(local_de_model, X):
+def _predict_local_de(local_de_model, X, return_confidence=False):
     X_enc = pd.get_dummies(X, columns=local_de_model['cat_cols'], dummy_na=False)
     X_enc = X_enc.reindex(columns=local_de_model['feature_columns'], fill_value=0.0)
     pred = local_de_model['model'].predict(X_enc)
-    return np.clip(pred, 0.0, None)
+    pred = np.clip(pred, 0.0, None)
+    if not return_confidence:
+        return pred
+    dists, _ = local_de_model['model'].kneighbors(X_enc, n_neighbors=1, return_distance=True)
+    distance_scale = float(local_de_model.get('distance_scale', 1.0))
+    conf = np.exp(-dists[:, 0] / max(distance_scale, 1e-9))
+    return pred, np.clip(conf, 0.0, 1.0)
+
+
+def _optimize_de_blend_weight(y_true, de_global, de_local, local_conf):
+    y_true = np.asarray(y_true, dtype=float)
+    de_global = np.asarray(de_global, dtype=float)
+    de_local = np.asarray(de_local, dtype=float)
+    local_conf = np.asarray(local_conf, dtype=float)
+
+    if len(y_true) == 0:
+        return {'mode': 'adaptive_confidence', 'beta': 1.0}
+
+    candidates = np.linspace(0.4, 2.2, 19)
+    best_beta = 1.0
+    best_mae = float('inf')
+    for beta in candidates:
+        w_local = np.clip(local_conf * beta, 0.0, 1.0)
+        blended = np.clip((1.0 - w_local) * de_global + w_local * de_local, 0.0, None)
+        mae = float(np.mean(np.abs(blended - y_true)))
+        if mae < best_mae:
+            best_mae = mae
+            best_beta = float(beta)
+    return {'mode': 'adaptive_confidence', 'beta': best_beta}
 
 
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
@@ -367,14 +400,20 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
     ]
     de_test_raw = np.clip(de_model.predict(X_test), 0, None)
     de_test_global = _apply_linear_de_calibrator(de_test_raw, de_calibration)
-    de_test_local = _predict_local_de(local_de_model, X_test)
-    df_fb['預測DE_模型'] = np.clip(0.45 * de_test_global + 0.55 * de_test_local, 0.0, None)
+    de_test_local, local_conf = _predict_local_de(local_de_model, X_test, return_confidence=True)
+    y_de_test = df_train.loc[X_test.index, 'CMC_DE'].values
+    blend_cfg = _optimize_de_blend_weight(y_de_test, de_test_global, de_test_local, local_conf)
+    beta = float(blend_cfg.get('beta', 1.0))
+    local_weight = np.clip(local_conf * beta, 0.0, 1.0)
+    global_weight = 1.0 - local_weight
+    df_fb['預測DE_模型'] = np.clip(global_weight * de_test_global + local_weight * de_test_local, 0.0, None)
 
     return {
         'model': model,
         'de_model': de_model,
         'de_calibration': de_calibration,
         'local_de_model': local_de_model,
+        'de_blend_weights': blend_cfg,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,
