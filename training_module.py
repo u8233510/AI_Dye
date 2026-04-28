@@ -13,6 +13,7 @@ from sklearn.ensemble import (
     RandomForestRegressor,
     VotingRegressor,
 )
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import Pipeline
@@ -230,6 +231,27 @@ def _apply_linear_de_calibrator(y_pred_raw, calibration):
     return np.clip(pred * slope + intercept, 0.0, None)
 
 
+def _fit_local_de_model(X_train, y_de_train):
+    cat_cols = [c for c in X_train.columns if X_train[c].dtype == object]
+    X_enc = pd.get_dummies(X_train, columns=cat_cols, dummy_na=False)
+    n = len(X_enc)
+    k = min(25, max(5, int(np.sqrt(max(n, 1)))))
+    local_model = KNeighborsRegressor(n_neighbors=k, weights='distance', metric='manhattan')
+    local_model.fit(X_enc, y_de_train)
+    return {
+        'model': local_model,
+        'cat_cols': cat_cols,
+        'feature_columns': list(X_enc.columns),
+    }
+
+
+def _predict_local_de(local_de_model, X):
+    X_enc = pd.get_dummies(X, columns=local_de_model['cat_cols'], dummy_na=False)
+    X_enc = X_enc.reindex(columns=local_de_model['feature_columns'], fill_value=0.0)
+    pred = local_de_model['model'].predict(X_enc)
+    return np.clip(pred, 0.0, None)
+
+
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
     model_params = model_params or {}
 
@@ -320,6 +342,7 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
     de_model.fit(X_train, y_de_train, reg__sample_weight=sample_weights)
     de_train_raw = np.clip(de_model.predict(X_train), 0, None)
     de_calibration = _fit_linear_de_calibrator(de_train_raw, y_de_train)
+    local_de_model = _fit_local_de_model(X_train, y_de_train)
 
     preds = model.predict(X_test)
 
@@ -341,12 +364,15 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
         for i in range(len(df_fb))
     ]
     de_test_raw = np.clip(de_model.predict(X_test), 0, None)
-    df_fb['預測DE_模型'] = _apply_linear_de_calibrator(de_test_raw, de_calibration)
+    de_test_global = _apply_linear_de_calibrator(de_test_raw, de_calibration)
+    de_test_local = _predict_local_de(local_de_model, X_test)
+    df_fb['預測DE_模型'] = np.clip(0.45 * de_test_global + 0.55 * de_test_local, 0.0, None)
 
     return {
         'model': model,
         'de_model': de_model,
         'de_calibration': de_calibration,
+        'local_de_model': local_de_model,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,
