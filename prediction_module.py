@@ -57,14 +57,20 @@ def render_prediction(tab_val):
             p_L = std_L_val + p_DL
             p_a = std_a_val + p_Da
             p_b = std_b_val + p_Db
-            de_val = deltaE_CMC((std_L_val, std_a_val, std_b_val), (p_L, p_a, p_b))
+            de_from_lab = deltaE_CMC((std_L_val, std_a_val, std_b_val), (p_L, p_a, p_b))
+            if 'de_model' in st.session_state:
+                de_val = max(float(st.session_state['de_model'].predict(X_m)[0]), 0.0)
+                de_source = '模型直預測'
+            else:
+                de_val = de_from_lab
+                de_source = '由 Lab 換算'
 
             with col_res:
                 st.write("### 📊 預測結果")
                 st.metric("預測 L*", f"{p_L:.2f}")
                 st.metric("預測 a*", f"{p_a:.2f}")
                 st.metric("預測 b*", f"{p_b:.2f}")
-                st.write(f"預測 CMC DE: `{de_val:.3f}`")
+                st.write(f"預測 CMC DE ({de_source}): `{de_val:.3f}`")
                 if de_val <= 0.8:
                     st.success("✅ 合格 (DE <= 0.8)")
                 else:

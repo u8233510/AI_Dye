@@ -20,6 +20,11 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from model_utils import clean_dye_id, deltaE_CMC, transform_bag_of_dyes
 
+try:
+    from catboost import CatBoostRegressor
+except ImportError:
+    CatBoostRegressor = None
+
 
 ARTIFACT_DIR = Path('.model_cache')
 
@@ -32,6 +37,7 @@ class ExplicitWeightedVotingRegressor(VotingRegressor):
 MODEL_LABELS = {
     'current_ensemble': '目前模型 (Voting Ensemble)',
     'automl_lite': 'AutoML-lite (RandomizedSearchCV)',
+    'catboost': 'CatBoost (Gradient Boosting)',
 }
 
 
@@ -77,6 +83,28 @@ def _build_automl_pipeline(pre):
         [
             ('pre', pre),
             ('reg', MultiOutputRegressor(RandomForestRegressor(random_state=42))),
+        ]
+    )
+
+
+def _build_catboost_pipeline(pre, model_params):
+    if CatBoostRegressor is None:
+        raise ImportError('CatBoost 未安裝，請先安裝 catboost 套件。')
+
+    cat = CatBoostRegressor(
+        loss_function='MAE',
+        iterations=int(model_params.get('cat_iterations', 1200)),
+        learning_rate=float(model_params.get('cat_learning_rate', 0.03)),
+        depth=int(model_params.get('cat_depth', 8)),
+        l2_leaf_reg=float(model_params.get('cat_l2_leaf_reg', 3.0)),
+        random_seed=42,
+        verbose=False,
+    )
+
+    return Pipeline(
+        [
+            ('pre', pre),
+            ('reg', MultiOutputRegressor(cat)),
         ]
     )
 
@@ -174,9 +202,41 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
             'best_params': best_params,
             'best_cv_score': best_score,
         }
+    elif model_type == 'catboost':
+        model = _build_catboost_pipeline(pre, model_params)
+        model.fit(X_train, Y_train, reg__sample_weight=sample_weights)
     else:
         model = _build_current_model(pre, model_params)
         model.fit(X_train, Y_train, reg__sample_weight=sample_weights)
+
+    # 額外訓練一個 CMC_DE 直接回歸模型，避免由 DL/Da/Db 間接換算時放大誤差
+    pre_de = _build_preprocessor(known_dyes)
+    if model_type == 'catboost':
+        de_model = Pipeline(
+            [
+                ('pre', pre_de),
+                (
+                    'reg',
+                    CatBoostRegressor(
+                        loss_function='MAE',
+                        iterations=int(model_params.get('cat_iterations', 1200)),
+                        learning_rate=float(model_params.get('cat_learning_rate', 0.03)),
+                        depth=int(model_params.get('cat_depth', 8)),
+                        l2_leaf_reg=float(model_params.get('cat_l2_leaf_reg', 3.0)),
+                        random_seed=42,
+                        verbose=False,
+                    ),
+                ),
+            ]
+        )
+    else:
+        de_model = Pipeline(
+            [
+                ('pre', pre_de),
+                ('reg', HistGradientBoostingRegressor(loss='absolute_error', max_iter=700, learning_rate=0.03, random_state=42)),
+            ]
+        )
+    de_model.fit(X_train, df_train.loc[X_train.index, 'CMC_DE'], reg__sample_weight=sample_weights)
 
     preds = model.predict(X_test)
 
@@ -197,9 +257,11 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
         )
         for i in range(len(df_fb))
     ]
+    df_fb['預測DE_模型'] = np.clip(de_model.predict(X_test), 0, None)
 
     return {
         'model': model,
+        'de_model': de_model,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,
@@ -230,6 +292,19 @@ def _render_model_params(model_type):
         params['n_iter'] = st.sidebar.slider('搜尋次數 (n_iter)', min_value=5, max_value=60, value=20, step=5)
         params['cv_folds'] = st.sidebar.selectbox('交叉驗證折數', [3, 4, 5], index=0)
         params['scoring'] = st.sidebar.selectbox('評分指標', ['neg_mean_absolute_error', 'neg_root_mean_squared_error'], index=0)
+    elif model_type == 'catboost':
+        st.sidebar.caption('CatBoost：先做穩定版，再與其他模型比較')
+        params['cat_iterations'] = st.sidebar.slider('CatBoost iterations', min_value=300, max_value=3000, value=1200, step=100)
+        params['cat_learning_rate'] = st.sidebar.number_input(
+            'CatBoost learning_rate',
+            min_value=0.005,
+            max_value=0.3,
+            value=0.03,
+            step=0.005,
+            format='%.3f',
+        )
+        params['cat_depth'] = st.sidebar.slider('CatBoost depth', min_value=4, max_value=12, value=8, step=1)
+        params['cat_l2_leaf_reg'] = st.sidebar.number_input('CatBoost l2_leaf_reg', min_value=1.0, max_value=20.0, value=3.0, step=0.5)
 
     return params
 
@@ -237,6 +312,8 @@ def _render_model_params(model_type):
 def render_training_button(df_raw, dye_cols):
     st.sidebar.markdown('---')
     st.sidebar.markdown('## 🤖 訓練模型選擇')
+    if CatBoostRegressor is None:
+        st.sidebar.warning('未偵測到 catboost 套件；若選 CatBoost 將無法訓練。')
 
     model_type = st.sidebar.selectbox('模型類型', options=list(MODEL_LABELS.keys()), format_func=lambda k: MODEL_LABELS[k])
     model_params = _render_model_params(model_type)
@@ -255,7 +332,11 @@ def render_training_button(df_raw, dye_cols):
             return
 
         with st.spinner('AI 運算中 (模型訓練中)...'):
-            state = train_model(df_raw, dye_cols, model_type=model_type, model_params=model_params)
+            try:
+                state = train_model(df_raw, dye_cols, model_type=model_type, model_params=model_params)
+            except ImportError as exc:
+                st.sidebar.error(str(exc))
+                return
             st.session_state.update(state)
             st.session_state['train_signature'] = signature
             _save_cached_state(signature, state)
