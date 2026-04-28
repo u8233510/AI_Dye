@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import streamlit as st
 
 from model_utils import deltaE_CMC, transform_bag_of_dyes
@@ -71,8 +72,15 @@ def render_prediction(tab_val):
                     X_local = pd.get_dummies(X_m, columns=local_pack['cat_cols'], dummy_na=False)
                     X_local = X_local.reindex(columns=local_pack['feature_columns'], fill_value=0.0)
                     de_local = max(float(local_pack['model'].predict(X_local)[0]), 0.0)
-                    de_val = max(float(0.45 * de_global + 0.55 * de_local), 0.0)
-                    de_source = '模型直預測(全域+近鄰混合)'
+                    dists, _ = local_pack['model'].kneighbors(X_local, n_neighbors=1, return_distance=True)
+                    distance_scale = float(local_pack.get('distance_scale', 1.0))
+                    local_conf = float(np.exp(-dists[0, 0] / max(distance_scale, 1e-9)))
+                    blend_cfg = st.session_state.get('de_blend_weights', {'mode': 'adaptive_confidence', 'beta': 1.0})
+                    beta = float(blend_cfg.get('beta', 1.0))
+                    w_local = min(max(local_conf * beta, 0.0), 1.0)
+                    w_global = 1.0 - w_local
+                    de_val = max(float(w_global * de_global + w_local * de_local), 0.0)
+                    de_source = f'模型直預測(全域{w_global:.2f}+近鄰{w_local:.2f}, conf={local_conf:.2f})'
                 else:
                     de_val = de_global
                     de_source = '模型直預測(全域校正)'
