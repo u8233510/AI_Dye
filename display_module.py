@@ -31,7 +31,13 @@ def _build_dye_vs_shade_table(df_ana, dye_cols):
 
 @st.cache_data(show_spinner=False)
 def _build_combination_stats(df_ana, dye_id_cols):
-    normalized = df_ana[dye_id_cols].applymap(clean_dye_id)
+    selected_cols = [col for col in dye_id_cols if col in df_ana.columns]
+    if not selected_cols:
+        return pd.DataFrame(
+            [{'染劑組合': '僅基礎藥劑(無染料)', '出現次數 (筆)': len(df_ana), '佔比 (%)': 100.0}]
+        )
+
+    normalized = df_ana[selected_cols].applymap(clean_dye_id)
 
     def _row_combination(row):
         dyes = sorted([d for d in row if d != '無'])
