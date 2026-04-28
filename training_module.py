@@ -205,6 +205,31 @@ def _save_cached_state(signature, state):
     joblib.dump(state, artifact_path)
 
 
+def _fit_linear_de_calibrator(y_pred_raw, y_true):
+    """用線性校正把 DE 直預測拉回實際分布，降低系統性高估/低估。"""
+    pred = np.asarray(y_pred_raw, dtype=float)
+    target = np.asarray(y_true, dtype=float)
+    if len(pred) < 2:
+        return {'slope': 1.0, 'intercept': 0.0}
+
+    if np.isclose(np.std(pred), 0.0):
+        return {'slope': 1.0, 'intercept': float(np.mean(target) - np.mean(pred))}
+
+    slope, intercept = np.polyfit(pred, target, deg=1)
+    if not np.isfinite(slope):
+        slope = 1.0
+    if not np.isfinite(intercept):
+        intercept = 0.0
+    return {'slope': float(slope), 'intercept': float(intercept)}
+
+
+def _apply_linear_de_calibrator(y_pred_raw, calibration):
+    pred = np.asarray(y_pred_raw, dtype=float)
+    slope = float(calibration.get('slope', 1.0))
+    intercept = float(calibration.get('intercept', 0.0))
+    return np.clip(pred * slope + intercept, 0.0, None)
+
+
 def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=None):
     model_params = model_params or {}
 
@@ -291,7 +316,10 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
                 ('reg', HistGradientBoostingRegressor(loss='absolute_error', max_iter=700, learning_rate=0.03, random_state=42)),
             ]
         )
-    de_model.fit(X_train, df_train.loc[X_train.index, 'CMC_DE'], reg__sample_weight=sample_weights)
+    y_de_train = df_train.loc[X_train.index, 'CMC_DE'].values
+    de_model.fit(X_train, y_de_train, reg__sample_weight=sample_weights)
+    de_train_raw = np.clip(de_model.predict(X_train), 0, None)
+    de_calibration = _fit_linear_de_calibrator(de_train_raw, y_de_train)
 
     preds = model.predict(X_test)
 
@@ -312,11 +340,13 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
         )
         for i in range(len(df_fb))
     ]
-    df_fb['預測DE_模型'] = np.clip(de_model.predict(X_test), 0, None)
+    de_test_raw = np.clip(de_model.predict(X_test), 0, None)
+    df_fb['預測DE_模型'] = _apply_linear_de_calibrator(de_test_raw, de_calibration)
 
     return {
         'model': model,
         'de_model': de_model,
+        'de_calibration': de_calibration,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,
