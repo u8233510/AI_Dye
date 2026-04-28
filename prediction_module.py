@@ -80,8 +80,9 @@ def render_prediction(tab_val):
                     margin = float(blend_cfg.get('margin', 0.0))
                     w_local = min(max(local_conf * beta, 0.0), 1.0)
                     w_global = 1.0 - w_local
-                    de_val = max(float(w_global * de_global + w_local * de_local + margin), 0.0)
-                    de_source = f'模型直預測(全域{w_global:.2f}+近鄰{w_local:.2f}, conf={local_conf:.2f}, +{margin:.2f})'
+                    margin_eff = margin * (1.0 - local_conf)
+                    de_val = max(float(w_global * de_global + w_local * de_local + margin_eff), 0.0)
+                    de_source = f'模型直預測(全域{w_global:.2f}+近鄰{w_local:.2f}, conf={local_conf:.2f}, +{margin_eff:.2f})'
                 else:
                     de_val = de_global
                     de_source = '模型直預測(全域校正)'

@@ -275,23 +275,29 @@ def _optimize_de_blend_weight(y_true, de_global, de_local, local_conf):
         return {'mode': 'adaptive_confidence', 'beta': 1.0, 'margin': 0.0}
 
     beta_candidates = np.linspace(0.4, 2.2, 19)
-    margin_candidates = np.linspace(0.0, 0.8, 17)
+    margin_candidates = np.linspace(0.0, 0.25, 11)
     best_cfg = {'mode': 'adaptive_confidence', 'beta': 1.0, 'margin': 0.0}
     best_score = float('inf')
     for beta in beta_candidates:
         w_local = np.clip(local_conf * beta, 0.0, 1.0)
         blended_base = np.clip((1.0 - w_local) * de_global + w_local * de_local, 0.0, None)
         for margin in margin_candidates:
-            blended = np.clip(blended_base + margin, 0.0, None)
+            margin_eff = margin * (1.0 - local_conf)
+            blended = np.clip(blended_base + margin_eff, 0.0, None)
             mae = float(np.mean(np.abs(blended - y_true)))
             high_cut = float(np.quantile(y_true, 0.9))
             high_mask = y_true >= high_cut
             high_mae = float(np.mean(np.abs(blended[high_mask] - y_true[high_mask]))) if np.any(high_mask) else mae
             actual_over = y_true > 0.8
             miss_rate = float(np.mean(blended[actual_over] <= 0.8)) if np.any(actual_over) else 0.0
+            actual_pass = y_true <= 0.8
+            false_reject_rate = float(np.mean(blended[actual_pass] > 0.8)) if np.any(actual_pass) else 0.0
+            pred_pass_rate = float(np.mean(blended <= 0.8))
+            actual_pass_rate = float(np.mean(actual_pass))
+            pass_rate_gap = abs(pred_pass_rate - actual_pass_rate)
 
-            # 主要壓低漏判率與高風險區誤差，次要兼顧整體MAE
-            score = 4.0 * miss_rate + 1.8 * high_mae + 0.3 * mae
+            # 平衡危險漏判與過度保守誤殺，避免「全部判失敗」
+            score = 2.0 * miss_rate + 2.5 * false_reject_rate + 1.2 * high_mae + 0.3 * mae + 2.0 * pass_rate_gap
             if score < best_score:
                 best_score = score
                 best_cfg = {'mode': 'adaptive_confidence', 'beta': float(beta), 'margin': float(margin)}
@@ -418,7 +424,8 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
     margin = float(blend_cfg.get('margin', 0.0))
     local_weight = np.clip(local_conf * beta, 0.0, 1.0)
     global_weight = 1.0 - local_weight
-    df_fb['預測DE_模型'] = np.clip(global_weight * de_test_global + local_weight * de_test_local + margin, 0.0, None)
+    margin_eff = margin * (1.0 - local_conf)
+    df_fb['預測DE_模型'] = np.clip(global_weight * de_test_global + local_weight * de_test_local + margin_eff, 0.0, None)
 
     return {
         'model': model,
