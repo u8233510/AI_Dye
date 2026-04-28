@@ -11,7 +11,7 @@ def _build_dye_vs_shade_table(df_ana, dye_cols):
     shade_names = sorted(shade_series.unique())
 
     long_df = (
-        df_ana[dye_cols + ['色系名稱']]
+        df_ana[list(dye_cols) + ['色系名稱']]
         .melt(id_vars='色系名稱', value_vars=dye_cols, value_name='dye')
         .assign(
             dye=lambda d: d['dye'].map(clean_dye_id),
