@@ -209,6 +209,35 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
         model = _build_current_model(pre, model_params)
         model.fit(X_train, Y_train, reg__sample_weight=sample_weights)
 
+    # 額外訓練一個 CMC_DE 直接回歸模型，避免由 DL/Da/Db 間接換算時放大誤差
+    pre_de = _build_preprocessor(known_dyes)
+    if model_type == 'catboost':
+        de_model = Pipeline(
+            [
+                ('pre', pre_de),
+                (
+                    'reg',
+                    CatBoostRegressor(
+                        loss_function='MAE',
+                        iterations=int(model_params.get('cat_iterations', 1200)),
+                        learning_rate=float(model_params.get('cat_learning_rate', 0.03)),
+                        depth=int(model_params.get('cat_depth', 8)),
+                        l2_leaf_reg=float(model_params.get('cat_l2_leaf_reg', 3.0)),
+                        random_seed=42,
+                        verbose=False,
+                    ),
+                ),
+            ]
+        )
+    else:
+        de_model = Pipeline(
+            [
+                ('pre', pre_de),
+                ('reg', HistGradientBoostingRegressor(loss='absolute_error', max_iter=700, learning_rate=0.03, random_state=42)),
+            ]
+        )
+    de_model.fit(X_train, df_train.loc[X_train.index, 'CMC_DE'], reg__sample_weight=sample_weights)
+
     preds = model.predict(X_test)
 
     df_val_raw = df_train.loc[X_test.index].copy()
@@ -228,9 +257,11 @@ def train_model(df_raw, dye_cols, model_type='current_ensemble', model_params=No
         )
         for i in range(len(df_fb))
     ]
+    df_fb['預測DE_模型'] = np.clip(de_model.predict(X_test), 0, None)
 
     return {
         'model': model,
+        'de_model': de_model,
         'kd': known_dyes,
         'fb': df_fb,
         'dc': dye_cols,

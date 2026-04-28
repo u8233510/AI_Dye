@@ -7,10 +7,11 @@ def render_training_feedback(tab_feedback, df_fb):
     with tab_feedback:
         st.header("📈 判定一致性回饋 (驗證集結果)")
 
-        tp = len(df_fb[(df_fb['實際DE'] <= 0.8) & (df_fb['預測DE'] <= 0.8)])
-        tn = len(df_fb[(df_fb['實際DE'] > 0.8) & (df_fb['預測DE'] > 0.8)])
-        fp = len(df_fb[(df_fb['實際DE'] > 0.8) & (df_fb['預測DE'] <= 0.8)])
-        fn = len(df_fb[(df_fb['實際DE'] <= 0.8) & (df_fb['預測DE'] > 0.8)])
+        de_col = '預測DE_模型' if '預測DE_模型' in df_fb.columns else '預測DE'
+        tp = len(df_fb[(df_fb['實際DE'] <= 0.8) & (df_fb[de_col] <= 0.8)])
+        tn = len(df_fb[(df_fb['實際DE'] > 0.8) & (df_fb[de_col] > 0.8)])
+        fp = len(df_fb[(df_fb['實際DE'] > 0.8) & (df_fb[de_col] <= 0.8)])
+        fn = len(df_fb[(df_fb['實際DE'] <= 0.8) & (df_fb[de_col] > 0.8)])
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("✅ 雙重通過", f"{tp}")
@@ -30,7 +31,7 @@ def render_training_feedback(tab_feedback, df_fb):
             ('DL', '實際DL', '預測DL'),
             ('Da', '實際Da', '預測Da'),
             ('Db', '實際Db', '預測Db'),
-            ('DE', '實際DE', '預測DE'),
+            ('DE', '實際DE', de_col),
         ]
 
         for label, act, pre in metrics_map:
