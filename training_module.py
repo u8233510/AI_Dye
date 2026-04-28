@@ -33,6 +33,7 @@ except ImportError:
 
 
 ARTIFACT_DIR = Path('.model_cache')
+TRAINING_PIPELINE_VERSION = '2026-04-28-v2'
 
 
 class ExplicitWeightedVotingRegressor(VotingRegressor):
@@ -186,6 +187,7 @@ def _dataset_fingerprint(df_raw, dye_cols):
 
 def _training_signature(df_raw, dye_cols, model_type, model_params):
     payload = {
+        'pipeline_version': TRAINING_PIPELINE_VERSION,
         'dataset': _dataset_fingerprint(df_raw, dye_cols),
         'model_type': model_type,
         'model_params': model_params,
@@ -446,14 +448,15 @@ def render_training_button(df_raw, dye_cols):
 
     model_type = st.sidebar.selectbox('模型類型', options=list(MODEL_LABELS.keys()), format_func=lambda k: MODEL_LABELS[k])
     model_params = _render_model_params(model_type)
+    force_retrain = st.sidebar.checkbox('忽略快取並強制重訓', value=False, help='勾選後會重新訓練，不使用記憶體與磁碟快取模型。')
     signature = _training_signature(df_raw, dye_cols, model_type, model_params)
 
     if st.sidebar.button('🚀 啟動模型訓練'):
-        if st.session_state.get('train_signature') == signature and 'model' in st.session_state:
+        if (not force_retrain) and st.session_state.get('train_signature') == signature and 'model' in st.session_state:
             st.sidebar.success('條件一致，已直接使用目前記憶體中的模型。')
             return
 
-        cached_state = _load_cached_state(signature)
+        cached_state = None if force_retrain else _load_cached_state(signature)
         if cached_state is not None:
             st.session_state.update(cached_state)
             st.session_state['train_signature'] = signature
