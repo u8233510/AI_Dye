@@ -49,6 +49,31 @@ def _build_combination_stats(df_ana, dye_id_cols):
     return comb_df
 
 
+
+def _render_delta_distribution(df_ana):
+    delta_specs = [
+        ('DL', 'DL 分布', '#636EFA'),
+        ('Da', 'Da 分布', '#EF553B'),
+        ('Db', 'Db 分布', '#00CC96'),
+        ('DE', 'DE 分布', '#AB63FA'),
+    ]
+
+    available = [spec for spec in delta_specs if spec[0] in df_ana.columns]
+    if not available:
+        st.info('目前資料中沒有 DL / Da / Db / DE 欄位，略過該分布圖。')
+        return
+
+    st.markdown('---')
+    st.subheader('🎯 訓練資料誤差指標分布 (DL / Da / Db / DE)')
+
+    cols = st.columns(len(available))
+    for ui_col, (field, title, color) in zip(cols, available):
+        with ui_col:
+            fig = px.histogram(df_ana, x=field, title=title, color_discrete_sequence=[color])
+            fig.update_layout(bargap=0.05)
+            st.plotly_chart(fig, use_container_width=True)
+
+
 def render_data_distribution(tab_ana, df_raw, dye_cols):
     with tab_ana:
         st.header('📊 全資料分布分析')
@@ -71,6 +96,8 @@ def render_data_distribution(tab_ana, df_raw, dye_cols):
                 px.histogram(df_ana, x='b', color='b_type', title='b* (黃/藍分布)', color_discrete_map={'黃': '#FECB52', '藍': '#636EFA'}),
                 use_container_width=True,
             )
+
+        _render_delta_distribution(df_ana)
 
         st.markdown('---')
         st.subheader('📋 染料料號對色系名稱統計表 (Dye vs. Shade Name)')
