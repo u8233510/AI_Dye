@@ -52,26 +52,62 @@ def _build_combination_stats(df_ana, dye_id_cols):
 
 def _render_delta_distribution(df_ana):
     delta_specs = [
-        ('DL', 'DL 分布', '#636EFA'),
-        ('Da', 'Da 分布', '#EF553B'),
-        ('Db', 'Db 分布', '#00CC96'),
-        ('DE', 'DE 分布', '#AB63FA'),
+        ('DL', ['DL', 'CIE_DL'], 'DL 分布', '#636EFA'),
+        ('Da', ['Da', 'CIE_Da'], 'Da 分布', '#EF553B'),
+        ('Db', ['Db', 'CIE_Db'], 'Db 分布', '#00CC96'),
+        ('DE', ['DE', 'CMC_DE'], 'DE 分布', '#AB63FA'),
     ]
 
-    available = [spec for spec in delta_specs if spec[0] in df_ana.columns]
+    available = []
+    for label, candidates, title, color in delta_specs:
+        source_col = next((col for col in candidates if col in df_ana.columns), None)
+        if source_col:
+            available.append((label, source_col, title, color))
+
     if not available:
-        st.info('目前資料中沒有 DL / Da / Db / DE 欄位，略過該分布圖。')
+        st.info('目前資料中沒有 DL/Da/Db/DE（或 CIE_DL/CIE_Da/CIE_Db/CMC_DE）欄位，略過該分布圖。')
         return
 
     st.markdown('---')
     st.subheader('🎯 訓練資料誤差指標分布 (DL / Da / Db / DE)')
 
     cols = st.columns(len(available))
-    for ui_col, (field, title, color) in zip(cols, available):
+    for ui_col, (label, source_col, title, color) in zip(cols, available):
         with ui_col:
-            fig = px.histogram(df_ana, x=field, title=title, color_discrete_sequence=[color])
+            title_with_source = f"{title}（來源欄位：{source_col}）"
+            fig = px.histogram(df_ana, x=source_col, title=title_with_source, color_discrete_sequence=[color])
             fig.update_layout(bargap=0.05)
             st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_training_feature_columns(df_ana, dye_cols):
+    st.markdown('---')
+    st.subheader('🧾 目前訓練模型輸入欄位')
+
+    base_features = [
+        'OP否',
+        '色系名稱',
+        '標準樣L',
+        '標準樣a',
+        '標準樣b',
+        'DPF',
+        '色系編號',
+        'Total_Conc',
+        'Log_Total_Conc',
+    ]
+    available_base = [col for col in base_features if col in df_ana.columns]
+
+    dye_feature_count = len([col for col in dye_cols if col in df_ana.columns])
+
+    st.write('固定欄位（含類別 One-Hot 後輸入模型）:')
+    st.code(', '.join(available_base) if available_base else '（無可用固定欄位）')
+
+    if dye_feature_count > 0:
+        st.write(f'染料欄位（Bag-of-Dyes 轉換）: 偵測到 {dye_feature_count} 欄，會展開為 `Dye_<料號>` 特徵。')
+    else:
+        st.write('染料欄位（Bag-of-Dyes 轉換）: 未偵測到可用染料欄位。')
+
+    st.caption('目標欄位（Y）為：CIE_DL、CIE_Da、CIE_Db；CMC_DE 另訓練 DE 專屬模型。')
 
 
 def render_data_distribution(tab_ana, df_raw, dye_cols):
@@ -98,6 +134,7 @@ def render_data_distribution(tab_ana, df_raw, dye_cols):
             )
 
         _render_delta_distribution(df_ana)
+        _render_training_feature_columns(df_ana, dye_cols)
 
         st.markdown('---')
         st.subheader('📋 染料料號對色系名稱統計表 (Dye vs. Shade Name)')
