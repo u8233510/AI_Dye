@@ -71,12 +71,19 @@ def _render_delta_distribution(df_ana):
     st.markdown('---')
     st.subheader('🎯 訓練資料誤差指標分布 (DL / Da / Db / DE)')
 
-    cols = st.columns(len(available))
-    for ui_col, (label, source_col, title, color) in zip(cols, available):
-        with ui_col:
+    st.caption('可用滑鼠框選區域縮放，雙擊可重置；下方每個指標皆為展開大圖。')
+
+    tabs = st.tabs([f'{label} 分布' for label, _, _, _ in available])
+    for tab, (label, source_col, title, color) in zip(tabs, available):
+        with tab:
             title_with_source = f"{title}（來源欄位：{source_col}）"
             fig = px.histogram(df_ana, x=source_col, title=title_with_source, color_discrete_sequence=[color])
-            fig.update_layout(bargap=0.05)
+            fig.update_layout(
+                bargap=0.05,
+                height=520,
+                xaxis=dict(rangeslider=dict(visible=True)),
+                dragmode='zoom',
+            )
             st.plotly_chart(fig, use_container_width=True)
 
 
